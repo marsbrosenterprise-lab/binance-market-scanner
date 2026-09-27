@@ -93,6 +93,7 @@ async def upsert_candle(session: AsyncSession, candle: CandleRecord) -> None:
         quote_volume=candle.quote_volume,
         trade_count=candle.trade_count,
         is_closed=candle.is_closed,
+        received_at=datetime.now(UTC),
     )
     statement = statement.on_conflict_do_update(
         index_elements=["symbol", "interval", "open_time"],
@@ -106,6 +107,7 @@ async def upsert_candle(session: AsyncSession, candle: CandleRecord) -> None:
             "quote_volume": statement.excluded.quote_volume,
             "trade_count": statement.excluded.trade_count,
             "is_closed": statement.excluded.is_closed,
+            "received_at": statement.excluded.received_at,
         },
     )
     await session.execute(statement)

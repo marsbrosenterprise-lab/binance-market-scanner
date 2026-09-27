@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     ingest_interval: str = "1m"
     ingest_backfill_limit: int = Field(default=500, ge=1, le=1000)
     signal_scan_seconds: int = Field(default=1, ge=1, le=3600)
+    market_data_max_age_seconds: int = Field(default=10, ge=1, le=3600)
     max_order_notional: float = Field(default=10.0, gt=0, le=1000)
 
     @property

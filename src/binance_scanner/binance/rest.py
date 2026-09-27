@@ -11,8 +11,15 @@ class BinanceRestError(RuntimeError):
 
 
 class BinanceRestClient:
-    def __init__(self, base_url: str, timeout_seconds: float = 10.0) -> None:
-        self._client = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=timeout_seconds)
+    def __init__(
+        self,
+        base_url: str,
+        timeout_seconds: float = 10.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"), timeout=timeout_seconds, transport=transport
+        )
 
     async def __aenter__(self) -> BinanceRestClient:
         await self._client.__aenter__()
@@ -40,6 +47,17 @@ class BinanceRestClient:
         if not isinstance(payload, list):
             raise BinanceRestError("Binance returned an invalid klines payload")
         return payload
+
+    async def get_ticker_price(self, symbol: str) -> str:
+        if not symbol or symbol != symbol.upper():
+            raise ValueError("symbol must be an uppercase Binance symbol")
+        payload = await self._get_json("/api/v3/ticker/price", params={"symbol": symbol})
+        if not isinstance(payload, Mapping) or not isinstance(payload.get("price"), str):
+            raise BinanceRestError("Binance returned an invalid ticker payload")
+        price = payload.get("price")
+        if not isinstance(price, str):
+            raise BinanceRestError("Binance returned an invalid ticker price")
+        return price
 
     async def _get_json(self, path: str, params: Mapping[str, Any] | None = None) -> Any:
         try:

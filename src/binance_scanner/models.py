@@ -119,6 +119,10 @@ class ConvertRequest(Base):
     quote_json: Mapped[str] = mapped_column(Text, nullable=False)
     order_id: Mapped[str | None] = mapped_column(String(128), index=True)
     order_status: Mapped[str | None] = mapped_column(String(32))
+    execution_claim_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    execution_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    execution_intent_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    reconciliation_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     approval_actor: Mapped[str | None] = mapped_column(String(128))
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(

@@ -13,6 +13,7 @@ import httpx
 from binance_scanner.execution import (
     ExecutionResult,
     OrderExecutionError,
+    OrderExecutionUncertain,
     OrderExecutor,
     OrderIntent,
 )
@@ -77,6 +78,16 @@ class BinanceTradingClient(OrderExecutor):
             )
             response.raise_for_status()
             payload = response.json()
+        except httpx.TimeoutException as exc:
+            raise OrderExecutionUncertain(
+                "signed Binance order request timed out; exchange outcome is unknown"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500:
+                raise OrderExecutionUncertain(
+                    "Binance returned a server error; exchange outcome is unknown"
+                ) from exc
+            raise OrderExecutionError("signed Binance order request was rejected") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise OrderExecutionError("signed Binance order request failed") from exc
         if not isinstance(payload, Mapping) or "orderId" not in payload:

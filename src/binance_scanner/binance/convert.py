@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import time
 from collections.abc import Callable, Mapping
-from decimal import Decimal, ROUND_DOWN
+from decimal import ROUND_DOWN, Decimal
 from typing import Any
 from urllib.parse import urlencode, urlparse
 

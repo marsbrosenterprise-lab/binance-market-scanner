@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: binance-scanner-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: scanner
+      POSTGRES_USER: scanner
+      POSTGRES_PASSWORD: scanner_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - scanner_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scanner -d scanner"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    command: ["sh", "-c", "alembic upgrade head && uvicorn binance_scanner.api:app --host 0.0.0.0 --port 8000"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scanner:scanner_dev_password@postgres:5432/scanner
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  ingestor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "binance_scanner.worker"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scanner:scanner_dev_password@postgres:5432/scanner
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "binance_scanner.signal_monitor"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://scanner:scanner_dev_password@postgres:5432/scanner
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  scanner_postgres_data:

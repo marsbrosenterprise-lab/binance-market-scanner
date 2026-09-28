@@ -100,6 +100,38 @@ dialog. Do not reuse `APPROVAL_TOKEN`, Binance keys, dashboard cookies, or the
 local static token. ChatGPT cannot reach `localhost` directly, and a local SDK
 test is not a ChatGPT connection.
 
+For a Keycloak realm named `binance`, the exact endpoint shapes are:
+
+| Purpose | URL |
+| --- | --- |
+| OAuth issuer | `https://AUTH_HOST/realms/binance` |
+| OIDC discovery | `https://AUTH_HOST/realms/binance/.well-known/openid-configuration` |
+| Authorization | `https://AUTH_HOST/realms/binance/protocol/openid-connect/auth` |
+| Token | `https://AUTH_HOST/realms/binance/protocol/openid-connect/token` |
+| Introspection | `https://AUTH_HOST/realms/binance/protocol/openid-connect/token/introspect` |
+| MCP resource | `https://MCP_RESOURCE_HOST/mcp` |
+| Protected-resource metadata | `https://MCP_RESOURCE_HOST/.well-known/oauth-protected-resource/mcp` |
+
+`AUTH_HOST` and `MCP_RESOURCE_HOST` remain user-supplied values. The code does
+not implement Keycloak or any other provider; it only validates the provider's
+introspection response. The provider must support Authorization Code with PKCE
+`S256`, advertise refresh/offline access, and issue tokens whose issuer and
+audience/resource exactly match the configured values.
+
+In ChatGPT Advanced OAuth, use the issuer/discovery metadata, authorization
+URL, and token URL above (or the values returned by discovery). Register the
+exact redirect URI displayed by ChatGPT; never guess it. Use the provider's
+supported client-registration method: prefer CIMD, otherwise use DCR or a
+predefined client when the ChatGPT form/provider requires it. ChatGPT does not
+use client-credentials OAuth for this connection. The introspection URL and
+resource-server client secret belong only in the scanner's protected
+environment, never in ChatGPT.
+
+The tunnel does not automatically expose a private authorization server. The
+authorization server's discovery and authorization endpoints must be reachable
+by the OAuth browser flow, even when MCP requests themselves travel through
+Secure MCP Tunnel.
+
 After explicit provider/hosting authorization: enter the exact HTTPS URL
 ending in `/mcp` in ChatGPT developer mode, select OAuth, complete the
 provider’s PKCE flow, grant `binance:read`, and grant `binance:draft` only when

@@ -189,11 +189,12 @@ mcp = MCPServer(
 
 
 def _protected_resource_metadata(_: object) -> JSONResponse:
+    settings = get_settings()
     return JSONResponse(
         {
-            "resource": _settings.mcp_resource_url,
-            "authorization_servers": [_settings.mcp_auth_issuer_url],
-            "scopes_supported": [_settings.mcp_required_scope, _settings.mcp_draft_scope],
+            "resource": settings.mcp_resource_url,
+            "authorization_servers": [settings.mcp_auth_issuer_url],
+            "scopes_supported": [settings.mcp_required_scope, settings.mcp_draft_scope],
             "bearer_methods_supported": ["header"],
         }
     )

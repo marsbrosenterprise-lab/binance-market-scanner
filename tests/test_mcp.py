@@ -5,13 +5,14 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from mcp.server.auth.provider import AccessToken
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from binance_scanner.config import Settings
 from binance_scanner.mcp_interface import (
     DraftInput,
     IntrospectionTokenVerifier,
     StaticTokenVerifier,
+    _protected_resource_metadata,
     _require_scope,
     mcp,
 )
@@ -78,6 +79,60 @@ def test_tool_scope_boundary_rejects_read_only_token(monkeypatch: pytest.MonkeyP
     assert _require_scope("binance:read") == read_only
     with pytest.raises(ToolError, match="binance:draft"):
         _require_scope("binance:draft")
+
+
+def test_protected_resource_metadata_advertises_issuer_and_separate_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        mcp_auth_mode="introspection",
+        mcp_auth_issuer_url="https://issuer.example.test/realms/binance",
+        mcp_resource_url="https://scanner.example.test/mcp",
+        mcp_introspection_url="https://issuer.example.test/realms/binance/introspect",
+        mcp_introspection_client_id="resource-client",
+        mcp_introspection_client_secret=SecretStr("resource-secret"),
+    )
+    monkeypatch.setattr("binance_scanner.mcp_interface.get_settings", lambda: settings)
+
+    response = _protected_resource_metadata(None)
+
+    assert response.status_code == 200
+    assert response.body is not None
+    body = response.body.decode()
+    assert settings.mcp_resource_url in body
+    assert settings.mcp_auth_issuer_url in body
+    assert settings.mcp_required_scope in body
+    assert settings.mcp_draft_scope in body
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"mcp_auth_issuer_url": "https://auth.example.invalid"}, "MCP_AUTH_ISSUER_URL"),
+        ({"mcp_introspection_url": None}, "MCP_INTROSPECTION_URL"),
+        ({"mcp_introspection_client_id": None}, "MCP_INTROSPECTION_CLIENT_ID"),
+        (
+            {"mcp_introspection_client_secret": SecretStr("")},
+            "MCP_INTROSPECTION_CLIENT_SECRET",
+        ),
+        ({"mcp_resource_url": "https://scanner.example.test/not-mcp"}, "MCP_RESOURCE_URL"),
+    ],
+)
+def test_introspection_settings_fail_fast(overrides: dict[str, object], message: str) -> None:
+    values: dict[str, object] = {
+        "_env_file": None,
+        "mcp_auth_mode": "introspection",
+        "mcp_auth_issuer_url": "https://issuer.example.test/realms/binance",
+        "mcp_resource_url": "https://scanner.example.test/mcp",
+        "mcp_introspection_url": "https://issuer.example.test/realms/binance/introspect",
+        "mcp_introspection_client_id": "resource-client",
+        "mcp_introspection_client_secret": SecretStr("resource-secret"),
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValidationError, match=message):
+        Settings(**values)
 
 
 @pytest.mark.asyncio

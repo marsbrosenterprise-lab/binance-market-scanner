@@ -28,11 +28,12 @@ class Symbol(Base):
 
 class Candle(Base):
     __tablename__ = "candles"
-    __table_args__ = (UniqueConstraint("symbol", "interval", "open_time"),)
+    __table_args__ = (UniqueConstraint("symbol", "interval", "open_time", "environment"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     interval: Mapped[str] = mapped_column(String(16), nullable=False)
+    environment: Mapped[str] = mapped_column(String(16), nullable=False, default="sandbox")
     open_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     close_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     open_price: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
@@ -58,6 +59,18 @@ class AuditEvent(Base):
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+
+
+class SafetyControl(Base):
+    __tablename__ = "safety_controls"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    emergency_stop: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reason: Mapped[str | None] = mapped_column(String(500))
+    updated_by: Mapped[str | None] = mapped_column(String(128))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
 

@@ -45,3 +45,15 @@ def test_demo_mode_accepts_demo_endpoints() -> None:
 
     assert settings.app_mode == "approval_demo"
     assert settings.trading_enabled is False
+
+
+def test_automatic_convert_requires_both_live_flags() -> None:
+    with pytest.raises(ValidationError, match="LIVE_CONVERT_ENABLED"):
+        Settings(_env_file=None, live_convert_auto_execution_enabled=True)
+
+
+def test_signed_endpoints_require_secure_schemes() -> None:
+    with pytest.raises(ValidationError, match="HTTPS"):
+        Settings(_env_file=None, binance_rest_base_url="http://testnet.binance.vision")
+    with pytest.raises(ValidationError, match="WSS"):
+        Settings(_env_file=None, binance_ws_base_url="ws://stream.testnet.binance.vision/ws")

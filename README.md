@@ -34,6 +34,7 @@ Offline backtests can be run with `python -m binance_scanner backtest --csv cand
 - Limit Convert plans are never automatically armed. Automatic execution requires the dashboard approval token and an explicit per-plan **Arm auto-execution** action; the local configuration flag is disabled by default.
 - Proposal risk checks use server-side Binance balances and the execution ledger when credentials are configured; browser-supplied balances are only accepted in explicit `paper`/`backtest` modes.
 - Signal stop/target values are informational only; the application does not place automatic exit orders.
+- A persistent emergency stop is available through the authenticated safety endpoint and is checked before arming or executing work.
 - Credentials are not committed or required for the Phase 1 health checks.
 
 See [docs/phase-0-requirements.md](docs/phase-0-requirements.md) for the approved scope and safety requirements.
@@ -56,3 +57,9 @@ ruff format --check .
 mypy src
 pytest
 ```
+
+GitHub Actions also provisions an isolated PostgreSQL service, applies all Alembic migrations, and runs the same checks on pushes and pull requests.
+
+## Not implemented yet
+
+Grid/ladder buying, position tracking, realized and unrealized P&L, reserved-balance accounting across multiple plans, and automatic profit-taking remain outside this reliability phase. Spot execution remains sandbox-only, and unresolved Spot submissions are marked for reconciliation using their client order ID before any retry is considered.

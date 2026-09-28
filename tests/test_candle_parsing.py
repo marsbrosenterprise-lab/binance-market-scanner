@@ -16,6 +16,7 @@ def test_parse_rest_kline() -> None:
     assert candle.close_price == Decimal("103")
     assert candle.trade_count == 42
     assert candle.is_closed is True
+    assert candle.environment == "sandbox"
 
 
 def test_parse_combined_websocket_kline() -> None:
@@ -45,3 +46,14 @@ def test_parse_combined_websocket_kline() -> None:
     assert candle.symbol == "BTCUSDT"
     assert candle.interval == "1m"
     assert candle.is_closed is False
+
+
+def test_candle_parser_preserves_environment_label() -> None:
+    candle = parse_rest_kline(
+        "XRPUSDT",
+        "1m",
+        [1700000000000, "1", "1", "1", "1", "1", 1700000059999, "1", 1],
+        environment="production",
+    )
+
+    assert candle.environment == "production"

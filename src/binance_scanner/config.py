@@ -15,6 +15,7 @@ AppMode = Literal[
     "read_only_demo",
     "approval_demo",
 ]
+MarketDataEnvironment = Literal["sandbox", "production"]
 
 
 class Settings(BaseSettings):
@@ -56,6 +57,7 @@ class Settings(BaseSettings):
     proposal_expiry_seconds: int = Field(default=300, ge=30, le=3600)
     binance_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     market_data_quote_asset: str = "USDT"
+    market_data_environment: MarketDataEnvironment = "sandbox"
     ingest_symbols: str = "BTCUSDT,ETHUSDT"
     ingest_interval: str = "1m"
     ingest_backfill_limit: int = Field(default=500, ge=1, le=1000)
@@ -87,8 +89,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def enforce_safety_boundary(self) -> Settings:
+        if self.market_data_environment != "sandbox":
+            raise ValueError("the configured ingestor may only persist sandbox market data")
         rest_host = (urlparse(str(self.binance_rest_base_url)).hostname or "").lower()
         ws_host = (urlparse(self.binance_ws_base_url).hostname or "").lower()
+        if urlparse(str(self.binance_rest_base_url)).scheme != "https":
+            raise ValueError("Binance REST endpoints must use HTTPS")
+        if urlparse(self.binance_ws_base_url).scheme != "wss":
+            raise ValueError("Binance WebSocket endpoints must use WSS")
 
         sandbox_hosts = {
             "testnet": ("testnet.binance.vision", "stream.testnet.binance.vision"),
@@ -109,8 +117,12 @@ class Settings(BaseSettings):
         if self.app_mode in {"read_only_testnet", "read_only_demo"} and self.trading_enabled:
             raise ValueError(f"{self.app_mode} cannot enable trading")
         convert_host = (urlparse(str(self.live_convert_rest_base_url)).hostname or "").lower()
+        if urlparse(str(self.live_convert_rest_base_url)).scheme != "https":
+            raise ValueError("live Convert endpoint must use HTTPS")
         if convert_host != "api.binance.com":
             raise ValueError("live Convert is restricted to api.binance.com")
+        if self.live_convert_auto_execution_enabled and not self.live_convert_enabled:
+            raise ValueError("automatic live Convert execution requires LIVE_CONVERT_ENABLED=true")
         if self.live_convert_enabled and (
             not self.live_convert_api_key
             or not self.live_convert_api_key.get_secret_value()

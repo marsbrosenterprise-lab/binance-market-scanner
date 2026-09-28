@@ -40,6 +40,7 @@ from binance_scanner.models import (
     AuditEvent,
     Candle,
     ConvertRequest,
+    SafetyControl,
     Symbol,
     TradeExecution,
     TradeProposal,
@@ -50,7 +51,9 @@ from binance_scanner.proposals import (
     expire_pending_proposals,
     record_audit_event,
 )
+from binance_scanner.recovery import reconcile_spot_executions
 from binance_scanner.risk import RiskEngine
+from binance_scanner.safety import execution_is_stopped, locked_safety_control
 from binance_scanner.signal_monitor import candidate_payload, scan_configured_symbols
 from binance_scanner.strategies import TrendMomentumStrategy
 
@@ -62,6 +65,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings.log_level)
     try:
+        session_factory = create_session_factory(settings.database_url)
+        async with session_factory() as session:
+            await reconcile_spot_executions(session, settings)
+            await session.commit()
         yield
     finally:
         await dispose_engines()
@@ -90,6 +97,11 @@ class ApprovalRequest(BaseModel):
 
 class ExecutionRequest(BaseModel):
     expected_version: int = Field(ge=1)
+
+
+class SafetyStopRequest(BaseModel):
+    enabled: bool
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class ConvertQuoteRequest(BaseModel):
@@ -161,6 +173,51 @@ async def readiness() -> dict[str, str]:
         "status": "ok",
         "mode": settings.app_mode,
         "trading_enabled": str(settings.trading_enabled).lower(),
+    }
+
+
+@app.get("/api/v1/safety", tags=["safety"])
+async def safety_status(
+    _: Annotated[AuthenticatedOperator, Depends(require_approval_token)],
+) -> dict[str, object]:
+    settings = get_settings()
+    session_factory = create_session_factory(settings.database_url)
+    async with session_factory() as session:
+        result = await session.execute(select(SafetyControl).where(SafetyControl.id == 1))
+        control = result.scalar_one_or_none()
+    return {
+        "emergency_stop": bool(control and control.emergency_stop),
+        "reason": control.reason if control else None,
+        "updated_by": control.updated_by if control else None,
+        "updated_at": control.updated_at if control else None,
+    }
+
+
+@app.post("/api/v1/safety/emergency-stop", tags=["safety"])
+async def set_emergency_stop(
+    request: SafetyStopRequest,
+    operator: Annotated[AuthenticatedOperator, Depends(require_approval_token)],
+) -> dict[str, object]:
+    settings = get_settings()
+    session_factory = create_session_factory(settings.database_url)
+    async with session_factory() as session:
+        control = await locked_safety_control(session)
+        control.emergency_stop = request.enabled
+        control.reason = request.reason
+        control.updated_by = operator.operator_id
+        await record_audit_event(
+            session,
+            "emergency_stop_enabled" if request.enabled else "emergency_stop_cleared",
+            "safety_service",
+            {"enabled": request.enabled, "operator_id": operator.operator_id},
+        )
+        await session.commit()
+        await session.refresh(control)
+    return {
+        "emergency_stop": control.emergency_stop,
+        "reason": control.reason,
+        "updated_by": control.updated_by,
+        "updated_at": control.updated_at,
     }
 
 
@@ -550,6 +607,11 @@ async def cancel_convert_limit(
         plan = result.scalar_one_or_none()
         if plan is None:
             raise HTTPException(status_code=404, detail="Convert limit plan not found")
+        if plan.state in {"executing", "processing", "reconciliation_required"}:
+            raise HTTPException(
+                status_code=409,
+                detail="execution is already claimed; cancellation cannot be guaranteed",
+            )
         if plan.state not in {"watching", "triggered"}:
             raise HTTPException(status_code=409, detail="Limit plan cannot be cancelled")
         plan.state = "cancelled"
@@ -583,6 +645,8 @@ async def arm_convert_limit(
         )
     session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
+        if await execution_is_stopped(session):
+            raise HTTPException(status_code=503, detail="emergency stop is enabled")
         result = await session.execute(
             select(ConvertRequest).where(ConvertRequest.id == request_id).with_for_update()
         )
@@ -626,6 +690,11 @@ async def disarm_convert_limit(
         plan = result.scalar_one_or_none()
         if plan is None:
             raise HTTPException(status_code=404, detail="Convert limit plan not found")
+        if plan.state in {"executing", "processing", "reconciliation_required"}:
+            raise HTTPException(
+                status_code=409,
+                detail="execution is already claimed; disarming cannot be guaranteed",
+            )
         if plan.state != "watching":
             raise HTTPException(
                 status_code=409, detail="Only a watching limit plan can be disarmed"
@@ -713,6 +782,8 @@ async def execute_convert_request(
     settings = get_settings()
     session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
+        if await execution_is_stopped(session):
+            raise HTTPException(status_code=503, detail="emergency stop is enabled")
         result = await session.execute(
             select(ConvertRequest).where(ConvertRequest.id == request_id).with_for_update()
         )
@@ -733,7 +804,7 @@ async def execute_convert_request(
                 accepted = await client.accept_quote(quote_id)
                 accepted_started = True
                 order_id = accepted.get("orderId")
-                status_payload = await client.order_status(
+                status_payload = await client.wait_for_order_status(
                     order_id=str(order_id) if order_id is not None else None, quote_id=quote_id
                 )
         except (BinanceConvertError, RuntimeError, ValueError) as exc:
@@ -753,7 +824,7 @@ async def execute_convert_request(
         if convert_request.order_status == "SUCCESS":
             convert_request.state = "completed"
             convert_request.reconciliation_required = False
-        elif convert_request.order_status in {"PROCESS", "PENDING"}:
+        elif convert_request.order_status in {"PROCESS", "PENDING", "ACCEPT_SUCCESS"}:
             convert_request.state = "processing"
             convert_request.reconciliation_required = True
         elif convert_request.order_status in {"FAIL", "FAILED", "CANCELED", "EXPIRED"}:
@@ -796,7 +867,12 @@ async def market_indicators(
     async with session_factory() as session:
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == normalized_symbol, Candle.interval == interval)
+            .where(
+                Candle.symbol == normalized_symbol,
+                Candle.interval == interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(limit)
         )
@@ -844,7 +920,12 @@ async def market_price(
     async with session_factory() as session:
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == normalized_symbol, Candle.interval == interval)
+            .where(
+                Candle.symbol == normalized_symbol,
+                Candle.interval == interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(1)
         )
@@ -886,7 +967,12 @@ async def market_signal(
     async with session_factory() as session:
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == normalized_symbol, Candle.interval == interval)
+            .where(
+                Candle.symbol == normalized_symbol,
+                Candle.interval == interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(limit)
         )
@@ -972,7 +1058,12 @@ async def create_trade_proposal(
         available_balance = max(account_balance - current_exposure, 0.0)
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == normalized_symbol, Candle.interval == request.interval)
+            .where(
+                Candle.symbol == normalized_symbol,
+                Candle.interval == request.interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(request.candle_limit)
         )
@@ -1114,7 +1205,12 @@ async def export_market_candles(
     async with session_factory() as session:
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == symbol.upper(), Candle.interval == interval)
+            .where(
+                Candle.symbol == symbol.upper(),
+                Candle.interval == interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(limit)
         )
@@ -1146,7 +1242,12 @@ async def run_backtest(request: BacktestRequest) -> dict[str, object]:
     async with session_factory() as session:
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == normalized_symbol, Candle.interval == request.interval)
+            .where(
+                Candle.symbol == normalized_symbol,
+                Candle.interval == request.interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(request.candle_limit)
         )
@@ -1270,6 +1371,8 @@ async def execute_trade_proposal(
     settings = get_settings()
     session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
+        if await execution_is_stopped(session):
+            raise HTTPException(status_code=503, detail="emergency stop is enabled")
         proposal_result = await session.execute(
             select(TradeProposal).where(TradeProposal.id == proposal_id).with_for_update()
         )
@@ -1308,7 +1411,12 @@ async def execute_trade_proposal(
             raise HTTPException(status_code=422, detail="order exceeds configured notional cap")
         latest_candle_result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == proposal.symbol, Candle.interval == proposal.interval)
+            .where(
+                Candle.symbol == proposal.symbol,
+                Candle.interval == proposal.interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(1)
         )

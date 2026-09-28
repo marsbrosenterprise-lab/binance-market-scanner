@@ -41,6 +41,7 @@ async def run_worker() -> None:
                     symbol,
                     settings.ingest_interval,
                     settings.ingest_backfill_limit,
+                    settings.market_data_environment,
                 )
             logger.info(
                 "historical candle backfill completed",
@@ -56,7 +57,7 @@ async def run_worker() -> None:
         "starting live candle ingestion",
         extra={"event_type": "candle_stream_start", "symbols": symbols},
     )
-    await consume_candle_stream(stream, session_factory)
+    await consume_candle_stream(stream, session_factory, settings.market_data_environment)
 
 
 def main() -> None:

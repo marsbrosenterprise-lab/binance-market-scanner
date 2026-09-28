@@ -19,6 +19,7 @@ from binance_scanner.indicators import CandlePoint
 from binance_scanner.logging import configure_logging
 from binance_scanner.models import Candle, ConvertRequest
 from binance_scanner.proposals import record_audit_event
+from binance_scanner.safety import execution_is_stopped
 from binance_scanner.strategies import SignalCandidate, TrendMomentumStrategy
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,12 @@ async def scan_configured_symbols(
     for symbol in symbols:
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == symbol, Candle.interval == interval)
+            .where(
+                Candle.symbol == symbol,
+                Candle.interval == interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(candle_limit)
         )
@@ -125,6 +131,16 @@ async def evaluate_convert_limits(session: AsyncSession, *, symbol: str, price: 
             plan.triggered_at = now
             await record_audit_event(
                 session, "convert_limit_triggered", "convert_monitor", trigger_details, str(plan.id)
+            )
+            continue
+
+        if await execution_is_stopped(session):
+            await record_audit_event(
+                session,
+                "convert_auto_execution_blocked",
+                "convert_monitor",
+                {**trigger_details, "error": "emergency stop is enabled"},
+                str(plan.id),
             )
             continue
 
@@ -227,15 +243,16 @@ async def evaluate_convert_limits(session: AsyncSession, *, symbol: str, price: 
                 order_id = accepted.get("orderId")
                 plan.order_id = str(order_id) if order_id is not None else None
                 await session.commit()
-                status_payload = await client.order_status(
+                status_payload = await client.wait_for_order_status(
                     order_id=str(order_id) if order_id is not None else None,
                     quote_id=quote_id,
                 )
             plan.order_status = str(status_payload.get("orderStatus", "UNKNOWN"))
             if plan.order_status == "SUCCESS":
                 plan.state = "completed"
-            elif plan.order_status in {"PROCESS", "PENDING"}:
+            elif plan.order_status in {"PROCESS", "PENDING", "ACCEPT_SUCCESS"}:
                 plan.state = "processing"
+                plan.reconciliation_required = True
             elif plan.order_status in {"FAIL", "FAILED", "CANCELED", "EXPIRED"}:
                 plan.state = "failed"
             else:
@@ -243,7 +260,7 @@ async def evaluate_convert_limits(session: AsyncSession, *, symbol: str, price: 
                 plan.reconciliation_required = True
             plan.version += 1
             plan.triggered_at = now
-            plan.completed_at = now
+            plan.completed_at = now if plan.state in {"completed", "failed"} else None
             await record_audit_event(
                 session,
                 "convert_auto_execution_completed"
@@ -307,7 +324,7 @@ async def reconcile_convert_executions(session: AsyncSession) -> int:
                 plan.state = "completed"
                 plan.completed_at = datetime.now(UTC)
                 plan.reconciliation_required = False
-            elif status_value in {"PROCESS", "PENDING"}:
+            elif status_value in {"PROCESS", "PENDING", "ACCEPT_SUCCESS"}:
                 plan.state = "processing"
                 plan.reconciliation_required = True
             elif status_value in {"FAIL", "FAILED", "CANCELED", "EXPIRED"}:
@@ -333,14 +350,15 @@ async def run_signal_monitor() -> None:
     configure_logging(settings.log_level)
     session_factory = create_session_factory(settings.database_url)
     previous: dict[str, str] = {}
-    recovery_done = False
+    last_recovery_at: datetime | None = None
     while True:
         try:
             async with session_factory() as session:
-                if not recovery_done:
+                now = datetime.now(UTC)
+                if last_recovery_at is None or (now - last_recovery_at).total_seconds() >= 5:
                     await reconcile_convert_executions(session)
                     await session.commit()
-                    recovery_done = True
+                    last_recovery_at = now
                 candidates = await scan_configured_symbols(
                     session, settings.ingest_symbol_list, settings.ingest_interval
                 )
@@ -364,7 +382,10 @@ async def run_signal_monitor() -> None:
                     latest = await session.execute(
                         select(Candle)
                         .where(
-                            Candle.symbol == "XRPUSDT", Candle.interval == settings.ingest_interval
+                            Candle.symbol == "XRPUSDT",
+                            Candle.interval == settings.ingest_interval,
+                            Candle.environment == "sandbox",
+                            Candle.is_closed.is_(True),
                         )
                         .order_by(desc(Candle.open_time))
                         .limit(1)

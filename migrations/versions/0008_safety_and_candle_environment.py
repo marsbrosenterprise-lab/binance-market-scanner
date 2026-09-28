@@ -5,7 +5,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0008_safety_and_candle_environment"
+revision: str = "0008_safety_candle_env"
 down_revision: str | None = "0007_convert_execution_recovery"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

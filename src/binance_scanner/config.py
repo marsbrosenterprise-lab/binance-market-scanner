@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     live_convert_max_from_amount: float = Field(default=10.0, gt=0, le=1000)
     approval_token: SecretStr | None = None
     operator_id: str = Field(default="local-operator", min_length=1, max_length=128)
+    mcp_auth_token: SecretStr | None = None
+    mcp_auth_mode: Literal["static", "introspection"] = "static"
+    mcp_auth_issuer_url: str = "https://auth.example.invalid"
+    mcp_resource_url: str = "http://localhost:8000/mcp"
+    mcp_required_scope: str = "binance:read"
+    mcp_draft_scope: str = "binance:draft"
+    mcp_static_scopes: str = "binance:read binance:draft"
+    mcp_introspection_url: str | None = None
+    mcp_introspection_client_id: str | None = None
+    mcp_introspection_client_secret: SecretStr | None = None
+    mcp_max_requests_per_minute: int = Field(default=60, ge=1, le=600)
 
     trading_enabled: bool = False
     withdrawals_enabled: bool = False
@@ -86,6 +97,10 @@ class Settings(BaseSettings):
             for asset in self.live_convert_allowed_to_assets.split(",")
             if asset.strip()
         ]
+
+    @property
+    def mcp_static_scope_list(self) -> list[str]:
+        return [scope.strip() for scope in self.mcp_static_scopes.split() if scope.strip()]
 
     @model_validator(mode="after")
     def enforce_safety_boundary(self) -> Settings:
@@ -137,7 +152,68 @@ class Settings(BaseSettings):
             or not self.binance_api_secret.get_secret_value()
         ):
             raise ValueError("trading requires Binance API credentials")
+        self._validate_mcp_authentication()
         return self
+
+    def _validate_mcp_authentication(self) -> None:
+        if not self.mcp_required_scope.strip() or not self.mcp_draft_scope.strip():
+            raise ValueError("MCP read and draft scopes must both be configured")
+        if self.mcp_required_scope == self.mcp_draft_scope:
+            raise ValueError("MCP read and draft scopes must be different")
+
+        resource = urlparse(self.mcp_resource_url)
+        if resource.scheme not in {"http", "https"} or not resource.netloc:
+            raise ValueError("MCP_RESOURCE_URL must be an absolute HTTP(S) URL")
+        if resource.query or resource.fragment or resource.path.rstrip("/") != "/mcp":
+            raise ValueError(
+                "MCP_RESOURCE_URL must be the canonical /mcp URL without query or fragment"
+            )
+
+        if self.mcp_auth_mode != "introspection":
+            return
+
+        if self.mcp_auth_issuer_url == "https://auth.example.invalid":
+            raise ValueError(
+                "MCP_AUTH_ISSUER_URL must be set to the OAuth issuer when "
+                "MCP_AUTH_MODE=introspection"
+            )
+        placeholder_values = {
+            "MCP_AUTH_ISSUER_URL": self.mcp_auth_issuer_url,
+            "MCP_RESOURCE_URL": self.mcp_resource_url,
+            "MCP_INTROSPECTION_URL": self.mcp_introspection_url or "",
+            "MCP_INTROSPECTION_CLIENT_ID": self.mcp_introspection_client_id or "",
+            "MCP_INTROSPECTION_CLIENT_SECRET": (
+                self.mcp_introspection_client_secret.get_secret_value()
+                if self.mcp_introspection_client_secret is not None
+                else ""
+            ),
+        }
+        for name, value in placeholder_values.items():
+            if any(marker in value for marker in ("YOUR-", "REPLACE_LOCALLY")):
+                raise ValueError(f"{name} still contains an example placeholder")
+        issuer = urlparse(self.mcp_auth_issuer_url)
+        if issuer.scheme != "https" or not issuer.netloc or issuer.query or issuer.fragment:
+            raise ValueError(
+                "MCP_AUTH_ISSUER_URL must be an HTTPS issuer URL without query or fragment"
+            )
+        if not self.mcp_introspection_url:
+            raise ValueError("MCP_INTROSPECTION_URL is required when MCP_AUTH_MODE=introspection")
+        introspection = urlparse(self.mcp_introspection_url)
+        if introspection.scheme != "https" or not introspection.netloc:
+            raise ValueError("MCP_INTROSPECTION_URL must be an absolute HTTPS URL")
+        if introspection.query or introspection.fragment:
+            raise ValueError("MCP_INTROSPECTION_URL must not contain a query or fragment")
+        if not self.mcp_introspection_client_id:
+            raise ValueError(
+                "MCP_INTROSPECTION_CLIENT_ID is required when MCP_AUTH_MODE=introspection"
+            )
+        if (
+            self.mcp_introspection_client_secret is None
+            or not self.mcp_introspection_client_secret.get_secret_value()
+        ):
+            raise ValueError(
+                "MCP_INTROSPECTION_CLIENT_SECRET is required when MCP_AUTH_MODE=introspection"
+            )
 
 
 @lru_cache(maxsize=1)

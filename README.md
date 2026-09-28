@@ -18,6 +18,13 @@ The risk engine evaluates candidates independently of execution. It applies per-
 
 Trade proposals are persisted with signal and risk snapshots. Proposal creation and approval require `APPROVAL_TOKEN`; approval only changes the proposal state to `approved`. Execution requires a separate authenticated request and is recorded in the execution ledger.
 The configured `OPERATOR_ID` is recorded in proposal audit events; approval tokens are never logged.
+
+The private MCP interface is available at `/mcp` when the API is running. It
+provides bounded, provenance-labelled market/account/status reads and saves
+unapproved analysis drafts. It has no trade, Convert acceptance, approval,
+arming, credential, safety-control, SQL, shell, or arbitrary-URL tool. See
+[docs/mcp.md](docs/mcp.md) for the OAuth/resource-server design and ChatGPT
+connection steps.
 The execution boundary supports a deterministic dry-run adapter and a separately gated Binance Spot Testnet adapter. The current default remains dry-run and never submits an exchange request.
 
 Live Convert uses separate credentials and is restricted to `api.binance.com`. Instant conversions follow quote → review → approval → accept, with a minimum from amount of 0.01 USDT. XRP trigger plans are application-managed and are not Binance-native limit orders. In live mode, the one-second monitor reads Binance's production public ticker; sandbox candles remain separate for demo/testnet analysis. A plan is manual by default. An operator can explicitly arm one plan for one-shot automatic execution; the monitor atomically claims it, requests a fresh quote, verifies that its effective rate satisfies the trigger, accepts it once, and reconciles the resulting order status. Pending, failed, and unknown outcomes are retained for recovery; an unknown outcome is never resubmitted automatically. Plans can be cancelled, disarmed, expire, and all lifecycle events are audited.

@@ -36,10 +36,12 @@ from binance_scanner.execution import (
 from binance_scanner.indicators import CandlePoint, IndicatorEngine
 from binance_scanner.logging import configure_logging
 from binance_scanner.market_data import parse_exchange_symbols
+from binance_scanner.mcp_interface import mcp, mcp_http_app
 from binance_scanner.models import (
     AuditEvent,
     Candle,
     ConvertRequest,
+    DraftProposal,
     SafetyControl,
     Symbol,
     TradeExecution,
@@ -69,7 +71,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         async with session_factory() as session:
             await reconcile_spot_executions(session, settings)
             await session.commit()
-        yield
+        async with mcp.session_manager.run():
+            yield
     finally:
         await dispose_engines()
 
@@ -1169,6 +1172,37 @@ async def execution_history(
     return [_execution_response(execution) for execution in executions]
 
 
+@app.get("/api/v1/drafts", tags=["approvals"])
+async def draft_history(
+    _: Annotated[AuthenticatedOperator, Depends(require_approval_token)],
+) -> list[dict[str, object]]:
+    """Show MCP drafts in the existing authenticated dashboard workflow."""
+    settings = get_settings()
+    session_factory = create_session_factory(settings.database_url)
+    async with session_factory() as session:
+        result = await session.execute(
+            select(DraftProposal).order_by(desc(DraftProposal.created_at)).limit(100)
+        )
+        drafts = result.scalars().all()
+    return [
+        {
+            "draft_id": draft.id,
+            "symbol": draft.symbol,
+            "action": draft.action,
+            "amount": str(draft.amount),
+            "amount_asset": draft.amount_asset,
+            "entry_condition": draft.entry_condition,
+            "expires_at": draft.expires_at,
+            "reasoning": draft.reasoning,
+            "uncertainty": draft.uncertainty,
+            "state": draft.state,
+            "origin": draft.origin,
+            "created_at": draft.created_at,
+        }
+        for draft in drafts
+    ]
+
+
 @app.get("/api/v1/audit", tags=["audit"])
 async def audit_events(
     _: Annotated[AuthenticatedOperator, Depends(require_approval_token)],
@@ -1303,6 +1337,7 @@ async def dashboard() -> str:
 <section id='liveConvertPanel' class='card' style='display:none'><h2>Live Convert</h2><p class='muted small danger'><strong>LIVE FUNDS.</strong> This mode reads your real Spot wallet. Binance Convert requires at least <strong>0.01 USDT</strong>. Use Binance’s native <strong>Limit Convert</strong> page for unattended limit conversions. This app supports analysis, balance checks, live-rate previews, and manual approval only; it will not automatically accept a live Convert quote.</p><div id='liveMarketPrice' class='rate-preview'>Live market price: connecting…</div><div class='toolbar'><label>From <input id='convertFrom' value='USDT' maxlength='16' onchange='invalidateLiveRate()'></label><label>To <input id='convertTo' value='XRP' maxlength='16' onchange='invalidateLiveRate()'></label><label>Amount (minimum 0.01 USDT) <input id='convertAmount' type='number' min='0.01' step='0.01' value='1' onchange='invalidateLiveRate()'></label><button class='primary' onclick='previewConvertRate()'>Get live rate</button><button class='primary' onclick='requestConvertQuote()'>Get quote</button></div><div id='liveRate' class='empty'>Enter your approval token to load the live Binance Convert rate.</div><div class='toolbar'><label>Trigger price (manual tracking only) <input id='limitPrice' type='number' min='0.00000001' step='0.0001' value='' placeholder='Load live rate first' disabled></label><button id='offset1' onclick='setSuggestedLimit(0.01)' disabled>Use 1% offset</button><button id='offset5' onclick='setSuggestedLimit(0.05)' disabled>Use 5% offset</button><button id='offset10' onclick='setSuggestedLimit(0.10)' disabled>Use 10% offset</button><label>Expires days <input id='limitDays' type='number' min='1' max='30' step='1' value='30'></label><button id='createLimitButton' class='primary' onclick='createConvertLimit()' disabled>Create tracking plan</button></div><div id='convertRequests'></div></section>
 <section class='card'><h2>Live signals <span class='muted small'>(watcher checks every second; signals refresh every 30 seconds)</span></h2><div id='signals' class='grid'></div></section>
 <section class='card'><h2>Pending approvals and executions</h2><div id='proposals'></div></section>
+<section class='card'><h2>MCP draft proposals</h2><p class='muted small'>Drafts are unapproved analysis records. They never reserve funds or execute trades; review them before using the existing approval workflow.</p><div id='drafts'></div></section>
 <script>
 let account=null;let selectedMode='demo';
 const $=id=>document.getElementById(id);
@@ -1333,7 +1368,8 @@ async function createProposal(symbol,button){if(!token()){setStatus('Enter the a
 async function loadSignals(){try{const data=await api('/api/v1/signals');$('signals').replaceChildren(...data.map(signal=>{const card=document.createElement('div');card.className='signal card '+(signal.status==='candidate'?'candidate':'');const candidate=signal.status==='candidate';card.innerHTML='<h3>'+signal.symbol+' <span class="badge '+signal.status+'">'+signal.status+'</span></h3><div class="kv"><span>Side</span><b>'+(signal.side||'—')+'</b><span>Confidence</span><b>'+((signal.confidence||0)*100).toFixed(1)+'%</b><span>Entry</span><b>'+(signal.entry_price??'—')+'</b><span>Stop</span><b>'+(signal.stop_price??'—')+'</b><span>Target</span><b>'+(signal.target_price??'—')+'</b></div><p class="muted small">'+(signal.rationale||[]).join(' · ')+'</p>';if(candidate){const actions=document.createElement('div');actions.className='actions';const button=document.createElement('button');button.className='primary';button.textContent='Create proposal';button.onclick=()=>createProposal(signal.symbol,button);actions.appendChild(button);card.appendChild(actions)}return card}));if(!data.length)$('signals').innerHTML='<div class="empty">No signals available.</div>'}catch(error){setStatus(error.message,true)}}
 async function proposalAction(id,operation,version){if(!token()){setStatus('Enter the approval token first',true);return}const text=operation==='approve'?'Approve this proposal? Review its symbol, quantity, and risk first.':'Submit this approved order to Binance Testnet? This action cannot be undone.';if(!window.confirm(text))return;try{const result=await api('/api/v1/proposals/'+id+'/'+operation,{method:'POST',body:JSON.stringify({expected_version:version})});setStatus(operation==='approve'?'Proposal approved.':'Testnet order submitted or simulated: '+(result.status||''));await loadProposals()}catch(error){setStatus(error.message,true)}}
 async function loadProposals(){try{const data=await api('/api/v1/proposals');const container=$('proposals');container.replaceChildren(...data.map(p=>{const card=document.createElement('div');card.className='card';const s=p.signal||{},r=p.risk||{};card.innerHTML='<h3>Proposal '+p.proposal_id+' · '+p.symbol+' <span class="badge">'+p.state+'</span></h3><div class="kv"><span>Signal</span><b>'+((s.side||'')+' '+((s.confidence||0)*100).toFixed(1)+'%')+'</b><span>Entry</span><b>'+(s.entry_price??'—')+'</b><span>Quantity</span><b>'+(r.quantity??'—')+'</b><span>Notional</span><b>'+(r.notional??'—')+' USDT</b><span>Estimated loss</span><b>'+(r.estimated_loss??'—')+' USDT</b><span>Expires</span><b>'+p.expires_at+'</b></div><div class="actions"></div>';const actions=card.querySelector('.actions');const button=document.createElement('button');button.className=p.state==='approved'?'warn':'primary';button.textContent=p.state==='approved'?'Execute Testnet order':'Approve proposal';button.onclick=()=>proposalAction(p.proposal_id,p.state==='approved'?'execute':'approve',p.version);actions.appendChild(button);return card}));if(!data.length)container.innerHTML='<div class="empty">No pending or approved proposals.</div>'}catch(error){setStatus(error.message,true)}}
-async function loadAll(){await Promise.all([loadMode(),loadSignals(),loadProposals(),selectedMode==='live'?loadConvertRequests():Promise.resolve()])}
+async function loadDrafts(){try{const data=await api('/api/v1/drafts');const container=$('drafts');container.replaceChildren(...data.map(d=>{const card=document.createElement('div');card.className='card';card.innerHTML='<h3>Draft '+d.draft_id+' · '+d.action+' '+d.symbol+' <span class="badge">'+d.state+'</span></h3><div class="kv"><span>Amount</span><b>'+d.amount+' '+d.amount_asset+'</b><span>Entry condition</span><b>'+d.entry_condition+'</b><span>Expires</span><b>'+d.expires_at+'</b><span>Origin</span><b>'+d.origin+'</b></div><p>'+d.reasoning+'</p><p class="muted small">Uncertainty: '+d.uncertainty+'</p>';return card}));if(!data.length)container.innerHTML='<div class="empty">No MCP drafts saved.</div>'}catch(error){if(token())setStatus(error.message,true)}}
+async function loadAll(){await Promise.all([loadMode(),loadSignals(),loadProposals(),loadDrafts(),selectedMode==='live'?loadConvertRequests():Promise.resolve()])}
 setMode('demo');loadAll();setInterval(()=>{loadMode();loadSignals();loadProposals();if(selectedMode==='live')loadConvertRequests()},30000);setInterval(()=>{if(selectedMode==='live')loadLiveMarketPrice()},1000);
 </script></main></body></html>"""
 
@@ -1546,3 +1582,8 @@ def _execution_response(execution: TradeExecution) -> dict[str, object]:
         "created_at": execution.created_at,
         "completed_at": execution.completed_at,
     }
+
+
+# Keep the MCP endpoint in the existing ASGI app. Existing routes are defined
+# before this catch-all mount, so dashboard and REST paths remain unchanged.
+app.mount("/", mcp_http_app)

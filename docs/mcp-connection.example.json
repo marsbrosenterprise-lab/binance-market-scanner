@@ -1,0 +1,11 @@
+{
+  "name": "Binance Market Scanner (private)",
+  "server_url": "https://YOUR_HTTPS_HOST/mcp",
+  "authentication": {
+    "type": "oauth2",
+    "issuer_url": "https://YOUR_AUTH_PROVIDER",
+    "scope": "binance:read",
+    "refresh_access": true
+  },
+  "notes": "Enter this endpoint in ChatGPT developer mode as a private custom MCP app. Do not put Binance credentials or approval tokens here."
+}

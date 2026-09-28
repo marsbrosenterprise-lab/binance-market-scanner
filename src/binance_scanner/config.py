@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     mcp_auth_issuer_url: str = "https://auth.example.invalid"
     mcp_resource_url: str = "http://localhost:8000/mcp"
     mcp_required_scope: str = "binance:read"
+    mcp_draft_scope: str = "binance:draft"
+    mcp_static_scopes: str = "binance:read binance:draft"
     mcp_introspection_url: str | None = None
     mcp_introspection_client_id: str | None = None
     mcp_introspection_client_secret: SecretStr | None = None
@@ -95,6 +97,10 @@ class Settings(BaseSettings):
             for asset in self.live_convert_allowed_to_assets.split(",")
             if asset.strip()
         ]
+
+    @property
+    def mcp_static_scope_list(self) -> list[str]:
+        return [scope.strip() for scope in self.mcp_static_scopes.split() if scope.strip()]
 
     @model_validator(mode="after")
     def enforce_safety_boundary(self) -> Settings:

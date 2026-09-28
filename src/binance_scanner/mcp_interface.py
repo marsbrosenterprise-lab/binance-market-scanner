@@ -5,10 +5,13 @@ from collections import deque
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hmac import compare_digest
+from time import time
 from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from mcp.server import MCPServer
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver.exceptions import ToolError
@@ -51,7 +54,7 @@ class StaticTokenVerifier(TokenVerifier):
         return AccessToken(
             token=token,
             client_id="chatgpt-private-mcp",
-            scopes=[settings.mcp_required_scope],
+            scopes=settings.mcp_static_scope_list,
             resource=settings.mcp_resource_url,
             subject=settings.operator_id,
         )
@@ -84,8 +87,25 @@ class IntrospectionTokenVerifier(TokenVerifier):
             return None
         if not isinstance(payload, dict) or payload.get("active") is not True:
             return None
+        if not _issuer_matches(payload.get("iss"), settings.mcp_auth_issuer_url):
+            return None
+        if not _resource_claim_matches(payload, settings.mcp_resource_url):
+            return None
+        now = int(time())
+        expires_at = _int_claim(payload.get("exp"))
+        if expires_at is None or expires_at <= now:
+            return None
+        not_before = _int_claim(payload.get("nbf"))
+        if not_before is not None and not_before > now:
+            return None
         raw_scopes = payload.get("scope", "")
-        scopes = raw_scopes.split() if isinstance(raw_scopes, str) else []
+        scopes = (
+            raw_scopes.split()
+            if isinstance(raw_scopes, str)
+            else [item for item in raw_scopes if isinstance(item, str)]
+            if isinstance(raw_scopes, list)
+            else []
+        )
         if settings.mcp_required_scope not in scopes:
             return None
         subject = payload.get("sub")
@@ -93,10 +113,49 @@ class IntrospectionTokenVerifier(TokenVerifier):
             token=token,
             client_id=str(payload.get("client_id", "chatgpt")),
             scopes=scopes,
+            expires_at=expires_at,
             resource=settings.mcp_resource_url,
             subject=subject if isinstance(subject, str) else None,
             claims=payload,
         )
+
+
+def _normalized_url(value: str) -> str:
+    parts = urlsplit(value)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+
+
+def _issuer_matches(value: object, expected: str) -> bool:
+    return isinstance(value, str) and _normalized_url(value) == _normalized_url(expected)
+
+
+def _int_claim(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _resource_claim_matches(payload: dict[str, object], expected: str) -> bool:
+    expected_normalized = _normalized_url(expected)
+    candidates: list[object] = []
+    for key in ("aud", "resource"):
+        value = payload.get(key)
+        candidates.extend(value if isinstance(value, list) else [value])
+    return any(
+        isinstance(candidate, str) and _normalized_url(candidate) == expected_normalized
+        for candidate in candidates
+    )
+
+
+def _require_scope(scope: str) -> AccessToken:
+    token = get_access_token()
+    if token is None or scope not in token.scopes:
+        raise ToolError(f"MCP token is missing required scope: {scope}")
+    return token
 
 
 def _auth_settings(settings: Settings) -> AuthSettings:
@@ -217,6 +276,7 @@ def _record_payload(record: Candle | CandleRecord) -> dict[str, str | bool]:
 @mcp.tool(title="Get bot status", annotations=READ_ANNOTATIONS)
 async def get_bot_status() -> dict[str, object]:
     """Return safe application health, mode, environment, and emergency-stop status."""
+    _require_scope(get_settings().mcp_required_scope)
     _rate_limit()
     settings = get_settings()
     factory = create_session_factory(settings.database_url)
@@ -241,6 +301,7 @@ async def get_market_snapshot(
     environment: Literal["sandbox", "production"] = "production",
 ) -> dict[str, object]:
     """Fetch bounded candle data and an indicative price with explicit provenance."""
+    _require_scope(get_settings().mcp_required_scope)
     _rate_limit()
     normalized = symbol.strip().upper()
     if not normalized or len(normalized) > 32 or not normalized.isalnum():
@@ -271,6 +332,7 @@ async def get_indicators(
     environment: Literal["sandbox", "production"] = "production",
 ) -> dict[str, object]:
     """Compute indicators from the same bounded, provenance-labelled market snapshot."""
+    _require_scope(get_settings().mcp_required_scope)
     _rate_limit()
     snapshot = await get_market_snapshot(symbol, interval, environment)
     candles = snapshot.get("candles")
@@ -301,6 +363,7 @@ async def get_indicators(
 @mcp.tool(title="Get account summary", annotations=READ_ANNOTATIONS)
 async def get_account_summary() -> dict[str, object]:
     """Read non-zero balances only; credentials never leave the backend."""
+    _require_scope(get_settings().mcp_required_scope)
     _rate_limit()
     settings = get_settings()
     key, secret = settings.binance_api_key, settings.binance_api_secret
@@ -347,6 +410,7 @@ def _convert_summary(request: ConvertRequest) -> dict[str, object]:
 @mcp.tool(title="List active plans", annotations=READ_ANNOTATIONS)
 async def list_active_plans() -> list[dict[str, object]]:
     """List active Convert plans without exposing quotes, credentials, or execution controls."""
+    _require_scope(get_settings().mcp_required_scope)
     _rate_limit()
     factory = create_session_factory(get_settings().database_url)
     async with factory() as session:
@@ -362,6 +426,7 @@ async def list_active_plans() -> list[dict[str, object]]:
 @mcp.tool(title="Get execution status", annotations=READ_ANNOTATIONS)
 async def get_execution_status() -> list[dict[str, object]]:
     """List unresolved execution ledger rows; this tool cannot retry or execute them."""
+    _require_scope(get_settings().mcp_required_scope)
     _rate_limit()
     factory = create_session_factory(get_settings().database_url)
     async with factory() as session:
@@ -388,6 +453,7 @@ async def get_execution_status() -> list[dict[str, object]]:
 @mcp.tool(title="Get trade history", annotations=READ_ANNOTATIONS)
 async def get_trade_history(limit: int = 50) -> list[dict[str, object]]:
     """Return bounded execution history without exchange-sensitive details."""
+    _require_scope(get_settings().mcp_required_scope)
     _rate_limit()
     limit = max(1, min(limit, MAX_ITEMS))
     factory = create_session_factory(get_settings().database_url)
@@ -453,6 +519,7 @@ def _draft_payload(draft: DraftProposal) -> dict[str, object]:
 @mcp.tool(title="Create draft proposal", annotations=WRITE_ANNOTATIONS)
 async def create_draft_proposal(draft: DraftInput) -> dict[str, object]:
     """Save an unapproved analysis draft; it cannot approve, arm, reserve, or execute funds."""
+    _require_scope(get_settings().mcp_draft_scope)
     _rate_limit()
     now = datetime.now(UTC)
     factory = create_session_factory(get_settings().database_url)
@@ -500,6 +567,7 @@ async def create_draft_proposal(draft: DraftInput) -> dict[str, object]:
 @mcp.tool(title="Get draft proposal", annotations=READ_ANNOTATIONS)
 async def get_draft_proposal(draft_id: int) -> dict[str, object]:
     """Retrieve one unapproved or reviewed draft for human review in the dashboard."""
+    _require_scope(get_settings().mcp_required_scope)
     _rate_limit()
     factory = create_session_factory(get_settings().database_url)
     async with factory() as session:

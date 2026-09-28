@@ -44,6 +44,16 @@ identity. The issuer must support refresh tokens/offline access for unattended
 reconnection. The server then verifies active tokens and the required scope on
 every request; it never logs or returns the token.
 
+Read tools require `binance:read`. `create_draft_proposal` additionally
+requires the separate `binance:draft` scope, enforced in the handler rather
+than relying on tool annotations. A draft is idempotent and remains
+`unapproved`; it cannot approve, arm, reserve funds, execute trades, accept a
+Convert quote, or change safety controls. `get_draft_proposal` is read-only.
+
+Introspection fails closed unless the response is active, issuer-matched,
+unexpired, not-before-valid, resource/audience-matched, and scoped. Revocation
+is observed on the next introspection request.
+
 ## Local test
 
 1. Run migrations and the API using `.env.example` plus a local database.
@@ -51,6 +61,57 @@ every request; it never logs or returns the token.
    commit it.
 3. Set `MCP_RESOURCE_URL=http://localhost:8000/mcp` for local MCP clients.
 4. Use the MCP Inspector or an SDK test client against `http://localhost:8000/mcp`.
+
+Use `/mcp` exactly; `/mcp/` is not the configured resource path. The SDK also
+serves protected-resource metadata at
+`/.well-known/oauth-protected-resource/mcp`. Local verification must cover an
+unauthenticated bearer challenge, MCP `initialize`, `tools/list`, and a
+harmless read-only `tools/call`. The FastAPI lifespan enters the MCP session
+manager during these requests.
+
+## Production provider inputs
+
+No OAuth provider, hosting provider, public tunnel, account, or callback has
+been selected or authorized. This service is a resource server; it does not
+implement an authorization server, login page, dynamic client registration,
+or an improvised token issuer. The selected provider must support Authorization
+Code with PKCE (S256), protected-resource and authorization-server discovery,
+refresh/offline access, and resource-server validation such as RFC 7662
+introspection. It must issue and validate `binance:read` and `binance:draft`,
+with issuer, audience/resource, expiry, revocation, and scope claims.
+
+Production configuration template:
+
+```dotenv
+MCP_AUTH_MODE=introspection
+MCP_AUTH_ISSUER_URL=https://YOUR-ISSUER.example
+MCP_RESOURCE_URL=https://YOUR-HOST.example/mcp
+MCP_INTROSPECTION_URL=https://YOUR-ISSUER.example/oauth2/introspect
+MCP_INTROSPECTION_CLIENT_ID=YOUR_RESOURCE_SERVER_CLIENT_ID
+MCP_INTROSPECTION_CLIENT_SECRET=YOUR_RESOURCE_SERVER_CLIENT_SECRET
+MCP_REQUIRED_SCOPE=binance:read
+MCP_DRAFT_SCOPE=binance:draft
+```
+
+The remaining external inputs are the issuer URL, public HTTPS resource URL,
+introspection URL, resource-server client ID/secret, selected provider, and
+the exact ChatGPT redirect URI shown by ChatGPT’s developer-mode connection
+dialog. Do not reuse `APPROVAL_TOKEN`, Binance keys, dashboard cookies, or the
+local static token. ChatGPT cannot reach `localhost` directly, and a local SDK
+test is not a ChatGPT connection.
+
+After explicit provider/hosting authorization: enter the exact HTTPS URL
+ending in `/mcp` in ChatGPT developer mode, select OAuth, complete the
+provider’s PKCE flow, grant `binance:read`, and grant `binance:draft` only when
+draft creation is intended. Then verify tool discovery with `get_bot_status`
+and confirm a test draft is still `unapproved`.
+
+Troubleshooting: authentication loops usually indicate a wrong endpoint,
+issuer, callback registration, PKCE, refresh access, or consent scope;
+discovery failures indicate incorrect protected-resource metadata or resource
+URL; tool-listing failures indicate a lifespan/migration/Streamable HTTP issue;
+read-success/draft-failure means the token lacks `binance:draft`. Never disable
+authentication to resolve these failures.
 
 ChatGPT cannot directly reach localhost. For ChatGPT, use a supported Secure
 MCP Tunnel or an HTTPS deployment that you control; do not open a public

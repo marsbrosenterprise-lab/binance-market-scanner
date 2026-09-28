@@ -6,7 +6,7 @@ import logging
 from binance_scanner.binance.rest import BinanceRestClient
 from binance_scanner.binance.ws import BinanceMarketStream
 from binance_scanner.config import get_settings
-from binance_scanner.database import create_session_factory
+from binance_scanner.database import create_session_factory, dispose_engines
 from binance_scanner.logging import configure_logging
 from binance_scanner.market_data import backfill_candles, consume_candle_stream, sync_symbols
 
@@ -41,6 +41,7 @@ async def run_worker() -> None:
                     symbol,
                     settings.ingest_interval,
                     settings.ingest_backfill_limit,
+                    settings.market_data_environment,
                 )
             logger.info(
                 "historical candle backfill completed",
@@ -56,7 +57,7 @@ async def run_worker() -> None:
         "starting live candle ingestion",
         extra={"event_type": "candle_stream_start", "symbols": symbols},
     )
-    await consume_candle_stream(stream, session_factory)
+    await consume_candle_stream(stream, session_factory, settings.market_data_environment)
 
 
 def main() -> None:
@@ -65,6 +66,8 @@ def main() -> None:
         asyncio.run(run_worker())
     except KeyboardInterrupt:
         logger.info("candle ingestion stopped", extra={"event_type": "worker_stop"})
+    finally:
+        asyncio.run(dispose_engines())
 
 
 if __name__ == "__main__":

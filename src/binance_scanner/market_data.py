@@ -29,13 +29,16 @@ class CandleRecord:
     quote_volume: Decimal
     trade_count: int
     is_closed: bool
+    environment: str = "sandbox"
 
 
 def _utc_from_ms(value: int) -> datetime:
     return datetime.fromtimestamp(value / 1000, tz=UTC)
 
 
-def parse_rest_kline(symbol: str, interval: str, payload: list[Any]) -> CandleRecord:
+def parse_rest_kline(
+    symbol: str, interval: str, payload: list[Any], environment: str = "sandbox"
+) -> CandleRecord:
     if len(payload) < 9:
         raise ValueError("Binance REST kline payload is incomplete")
     return CandleRecord(
@@ -51,10 +54,11 @@ def parse_rest_kline(symbol: str, interval: str, payload: list[Any]) -> CandleRe
         quote_volume=Decimal(str(payload[7])),
         trade_count=int(payload[8]),
         is_closed=True,
+        environment=environment,
     )
 
 
-def parse_ws_kline(payload: Mapping[str, Any]) -> CandleRecord:
+def parse_ws_kline(payload: Mapping[str, Any], environment: str = "sandbox") -> CandleRecord:
     data = payload.get("data", payload)
     kline = data.get("k") if isinstance(data, dict) else None
     if not isinstance(kline, dict):
@@ -76,6 +80,7 @@ def parse_ws_kline(payload: Mapping[str, Any]) -> CandleRecord:
         quote_volume=Decimal(str(kline["q"])),
         trade_count=int(kline["n"]),
         is_closed=bool(kline["x"]),
+        environment=environment,
     )
 
 
@@ -83,6 +88,7 @@ async def upsert_candle(session: AsyncSession, candle: CandleRecord) -> None:
     statement = insert(Candle).values(
         symbol=candle.symbol,
         interval=candle.interval,
+        environment=candle.environment,
         open_time=candle.open_time,
         close_time=candle.close_time,
         open_price=candle.open_price,
@@ -93,9 +99,10 @@ async def upsert_candle(session: AsyncSession, candle: CandleRecord) -> None:
         quote_volume=candle.quote_volume,
         trade_count=candle.trade_count,
         is_closed=candle.is_closed,
+        received_at=datetime.now(UTC),
     )
     statement = statement.on_conflict_do_update(
-        index_elements=["symbol", "interval", "open_time"],
+        index_elements=["symbol", "interval", "open_time", "environment"],
         set_={
             "close_time": statement.excluded.close_time,
             "open_price": statement.excluded.open_price,
@@ -106,6 +113,7 @@ async def upsert_candle(session: AsyncSession, candle: CandleRecord) -> None:
             "quote_volume": statement.excluded.quote_volume,
             "trade_count": statement.excluded.trade_count,
             "is_closed": statement.excluded.is_closed,
+            "received_at": statement.excluded.received_at,
         },
     )
     await session.execute(statement)
@@ -117,18 +125,21 @@ async def backfill_candles(
     symbol: str,
     interval: str = "1m",
     limit: int = 500,
+    environment: str = "sandbox",
 ) -> int:
     rows = await client.get_klines(symbol, interval, limit)
     for row in rows:
-        await upsert_candle(session, parse_rest_kline(symbol, interval, row))
+        await upsert_candle(session, parse_rest_kline(symbol, interval, row, environment))
     await session.commit()
     return len(rows)
 
 
-async def consume_candle_stream(stream: BinanceMarketStream, session_factory: Any) -> None:
+async def consume_candle_stream(
+    stream: BinanceMarketStream, session_factory: Any, environment: str = "sandbox"
+) -> None:
     async for payload in stream.events():
         try:
-            candle = parse_ws_kline(payload)
+            candle = parse_ws_kline(payload, environment)
         except (KeyError, TypeError, ValueError):
             continue
         async with session_factory() as session:

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import time
 from collections.abc import Callable, Mapping
-from decimal import Decimal, ROUND_DOWN
+from decimal import ROUND_DOWN, Decimal
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
@@ -90,6 +91,20 @@ class BinanceConvertClient:
         if quote_id:
             params["quoteId"] = quote_id
         return await self._get("/sapi/v1/convert/orderStatus", params)
+
+    async def wait_for_order_status(
+        self, *, order_id: str | None = None, quote_id: str | None = None
+    ) -> Mapping[str, Any]:
+        """Poll briefly after acceptance; unresolved results remain recoverable."""
+        last: Mapping[str, Any] = {}
+        for delay in (0.0, 0.5, 1.0, 2.0):
+            if delay:
+                await asyncio.sleep(delay)
+            last = await self.order_status(order_id=order_id, quote_id=quote_id)
+            status = str(last.get("orderStatus", "UNKNOWN")).upper()
+            if status in {"SUCCESS", "FAIL", "FAILED", "CANCELED", "EXPIRED"}:
+                return last
+        return last
 
     async def _post(self, path: str, values: Mapping[str, str]) -> Mapping[str, Any]:
         params = self._signed_params(values)

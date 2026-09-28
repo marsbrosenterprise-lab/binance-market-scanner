@@ -4,15 +4,15 @@ services:
     container_name: binance-scanner-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: scanner
-      POSTGRES_USER: scanner
-      POSTGRES_PASSWORD: scanner_dev_password
+      POSTGRES_DB: ${POSTGRES_DB:-scanner}
+      POSTGRES_USER: ${POSTGRES_USER:-scanner}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - scanner_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U scanner -d scanner"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -22,10 +22,10 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - .env
+      - ${APP_ENV_FILE:-.env}
     command: ["sh", "-c", "alembic upgrade head && uvicorn binance_scanner.api:app --host 0.0.0.0 --port 8000"]
     environment:
-      DATABASE_URL: postgresql+asyncpg://scanner:scanner_dev_password@postgres:5432/scanner
+      DATABASE_URL: ${DATABASE_URL_DOCKER:?Set DATABASE_URL_DOCKER in .env}
     depends_on:
       postgres:
         condition: service_healthy
@@ -38,9 +38,9 @@ services:
       dockerfile: Dockerfile
     command: ["python", "-m", "binance_scanner.worker"]
     env_file:
-      - .env
+      - ${APP_ENV_FILE:-.env}
     environment:
-      DATABASE_URL: postgresql+asyncpg://scanner:scanner_dev_password@postgres:5432/scanner
+      DATABASE_URL: ${DATABASE_URL_DOCKER:?Set DATABASE_URL_DOCKER in .env}
     depends_on:
       postgres:
         condition: service_healthy
@@ -51,9 +51,9 @@ services:
       dockerfile: Dockerfile
     command: ["python", "-m", "binance_scanner.signal_monitor"]
     env_file:
-      - .env
+      - ${APP_ENV_FILE:-.env}
     environment:
-      DATABASE_URL: postgresql+asyncpg://scanner:scanner_dev_password@postgres:5432/scanner
+      DATABASE_URL: ${DATABASE_URL_DOCKER:?Set DATABASE_URL_DOCKER in .env}
     depends_on:
       postgres:
         condition: service_healthy

@@ -23,13 +23,14 @@ from binance_scanner.binance.account import (
 )
 from binance_scanner.binance.convert import BinanceConvertClient, BinanceConvertError
 from binance_scanner.binance.filters import normalize_risk_quantity, validate_order_intent
-from binance_scanner.binance.rest import BinanceRestClient
+from binance_scanner.binance.rest import BinanceRestClient, BinanceRestError
 from binance_scanner.binance.trading import BinanceTradingClient
 from binance_scanner.config import get_settings
-from binance_scanner.database import check_database, create_session_factory
+from binance_scanner.database import check_database, create_session_factory, dispose_engines
 from binance_scanner.execution import (
     DryRunOrderExecutor,
     OrderExecutionError,
+    OrderExecutionUncertain,
     order_intent_from_proposal,
 )
 from binance_scanner.indicators import CandlePoint, IndicatorEngine
@@ -39,6 +40,7 @@ from binance_scanner.models import (
     AuditEvent,
     Candle,
     ConvertRequest,
+    SafetyControl,
     Symbol,
     TradeExecution,
     TradeProposal,
@@ -49,7 +51,9 @@ from binance_scanner.proposals import (
     expire_pending_proposals,
     record_audit_event,
 )
+from binance_scanner.recovery import reconcile_spot_executions
 from binance_scanner.risk import RiskEngine
+from binance_scanner.safety import execution_is_stopped, locked_safety_control
 from binance_scanner.signal_monitor import candidate_payload, scan_configured_symbols
 from binance_scanner.strategies import TrendMomentumStrategy
 
@@ -60,7 +64,14 @@ from binance_scanner.strategies import TrendMomentumStrategy
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings.log_level)
-    yield
+    try:
+        session_factory = create_session_factory(settings.database_url)
+        async with session_factory() as session:
+            await reconcile_spot_executions(session, settings)
+            await session.commit()
+        yield
+    finally:
+        await dispose_engines()
 
 
 app = FastAPI(
@@ -86,6 +97,11 @@ class ApprovalRequest(BaseModel):
 
 class ExecutionRequest(BaseModel):
     expected_version: int = Field(ge=1)
+
+
+class SafetyStopRequest(BaseModel):
+    enabled: bool
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class ConvertQuoteRequest(BaseModel):
@@ -157,6 +173,51 @@ async def readiness() -> dict[str, str]:
         "status": "ok",
         "mode": settings.app_mode,
         "trading_enabled": str(settings.trading_enabled).lower(),
+    }
+
+
+@app.get("/api/v1/safety", tags=["safety"])
+async def safety_status(
+    _: Annotated[AuthenticatedOperator, Depends(require_approval_token)],
+) -> dict[str, object]:
+    settings = get_settings()
+    session_factory = create_session_factory(settings.database_url)
+    async with session_factory() as session:
+        result = await session.execute(select(SafetyControl).where(SafetyControl.id == 1))
+        control = result.scalar_one_or_none()
+    return {
+        "emergency_stop": bool(control and control.emergency_stop),
+        "reason": control.reason if control else None,
+        "updated_by": control.updated_by if control else None,
+        "updated_at": control.updated_at if control else None,
+    }
+
+
+@app.post("/api/v1/safety/emergency-stop", tags=["safety"])
+async def set_emergency_stop(
+    request: SafetyStopRequest,
+    operator: Annotated[AuthenticatedOperator, Depends(require_approval_token)],
+) -> dict[str, object]:
+    settings = get_settings()
+    session_factory = create_session_factory(settings.database_url)
+    async with session_factory() as session:
+        control = await locked_safety_control(session)
+        control.emergency_stop = request.enabled
+        control.reason = request.reason
+        control.updated_by = operator.operator_id
+        await record_audit_event(
+            session,
+            "emergency_stop_enabled" if request.enabled else "emergency_stop_cleared",
+            "safety_service",
+            {"enabled": request.enabled, "operator_id": operator.operator_id},
+        )
+        await session.commit()
+        await session.refresh(control)
+    return {
+        "emergency_stop": control.emergency_stop,
+        "reason": control.reason,
+        "updated_by": control.updated_by,
+        "updated_at": control.updated_at,
     }
 
 
@@ -237,7 +298,9 @@ async def live_account_balances(
         ) as client:
             account = await client.get_account()
     except (BinanceAccountError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="Live Binance account verification failed") from exc
+        raise HTTPException(
+            status_code=502, detail="Live Binance account verification failed"
+        ) from exc
     balances = non_zero_balances(account)
     session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
@@ -398,7 +461,9 @@ async def preview_convert_rate(
             quoted_from / quoted_to if from_asset == "USDT" else quoted_to / quoted_from
         )
     except (KeyError, ValueError, ArithmeticError) as exc:
-        raise HTTPException(status_code=502, detail="Binance returned an incomplete Convert quote") from exc
+        raise HTTPException(
+            status_code=502, detail="Binance returned an incomplete Convert quote"
+        ) from exc
     return {
         "from_asset": from_asset,
         "to_asset": to_asset,
@@ -435,7 +500,9 @@ async def create_convert_limit(
     if request.from_amount > Decimal(str(settings.live_convert_max_from_amount)):
         raise HTTPException(status_code=422, detail="conversion exceeds configured amount cap")
     if {from_asset, to_asset} != {"USDT", "XRP"}:
-        raise HTTPException(status_code=422, detail="Limit Convert currently supports USDT/XRP only")
+        raise HTTPException(
+            status_code=422, detail="Limit Convert currently supports USDT/XRP only"
+        )
     trigger_direction = "at_or_below" if to_asset == "XRP" else "at_or_above"
     session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
@@ -496,7 +563,9 @@ async def quote_triggered_convert_limit(
             raise HTTPException(status_code=409, detail="Limit plan has expired")
         try:
             async with _convert_client(settings) as client:
-                quote = await client.get_quote(plan.from_asset, plan.to_asset, str(plan.from_amount))
+                quote = await client.get_quote(
+                    plan.from_asset, plan.to_asset, str(plan.from_amount)
+                )
         except (BinanceConvertError, RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         quote_id = quote.get("quoteId")
@@ -538,6 +607,11 @@ async def cancel_convert_limit(
         plan = result.scalar_one_or_none()
         if plan is None:
             raise HTTPException(status_code=404, detail="Convert limit plan not found")
+        if plan.state in {"executing", "processing", "reconciliation_required"}:
+            raise HTTPException(
+                status_code=409,
+                detail="execution is already claimed; cancellation cannot be guaranteed",
+            )
         if plan.state not in {"watching", "triggered"}:
             raise HTTPException(status_code=409, detail="Limit plan cannot be cancelled")
         plan.state = "cancelled"
@@ -561,16 +635,18 @@ async def arm_convert_limit(
     _: Annotated[None, Depends(require_live_convert_mode)],
 ) -> dict[str, object]:
     """Explicitly authorize one unattended execution when the trigger is reached."""
-    if not get_settings().live_convert_auto_execution_enabled:
+    settings = get_settings()
+    if not settings.live_convert_enabled or not settings.live_convert_auto_execution_enabled:
         raise HTTPException(
             status_code=409,
             detail=(
-                "Custom automatic Convert execution is disabled. Use Binance's native "
-                "Convert Limit page for unattended limit conversions."
+                "Live Convert and automatic execution must both be enabled before arming a plan."
             ),
         )
-    session_factory = create_session_factory(get_settings().database_url)
+    session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
+        if await execution_is_stopped(session):
+            raise HTTPException(status_code=503, detail="emergency stop is enabled")
         result = await session.execute(
             select(ConvertRequest).where(ConvertRequest.id == request_id).with_for_update()
         )
@@ -614,8 +690,15 @@ async def disarm_convert_limit(
         plan = result.scalar_one_or_none()
         if plan is None:
             raise HTTPException(status_code=404, detail="Convert limit plan not found")
+        if plan.state in {"executing", "processing", "reconciliation_required"}:
+            raise HTTPException(
+                status_code=409,
+                detail="execution is already claimed; disarming cannot be guaranteed",
+            )
         if plan.state != "watching":
-            raise HTTPException(status_code=409, detail="Only a watching limit plan can be disarmed")
+            raise HTTPException(
+                status_code=409, detail="Only a watching limit plan can be disarmed"
+            )
         plan.auto_execute = False
         plan.armed_by = None
         plan.armed_at = None
@@ -699,6 +782,8 @@ async def execute_convert_request(
     settings = get_settings()
     session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
+        if await execution_is_stopped(session):
+            raise HTTPException(status_code=503, detail="emergency stop is enabled")
         result = await session.execute(
             select(ConvertRequest).where(ConvertRequest.id == request_id).with_for_update()
         )
@@ -713,15 +798,18 @@ async def execute_convert_request(
         quote_id = convert_request.quote_id
         if not quote_id:
             raise HTTPException(status_code=422, detail="Convert request has no quote ID")
+        accepted_started = False
         try:
             async with _convert_client(settings) as client:
                 accepted = await client.accept_quote(quote_id)
+                accepted_started = True
                 order_id = accepted.get("orderId")
-                status_payload = await client.order_status(
+                status_payload = await client.wait_for_order_status(
                     order_id=str(order_id) if order_id is not None else None, quote_id=quote_id
                 )
         except (BinanceConvertError, RuntimeError, ValueError) as exc:
-            convert_request.state = "failed"
+            convert_request.state = "reconciliation_required" if accepted_started else "failed"
+            convert_request.reconciliation_required = accepted_started
             convert_request.version += 1
             await record_audit_event(
                 session,
@@ -732,11 +820,24 @@ async def execute_convert_request(
             )
             await session.commit()
             raise HTTPException(status_code=502, detail="live Convert execution failed") from exc
-        convert_request.state = "completed"
+        convert_request.order_status = str(status_payload.get("orderStatus", "UNKNOWN"))
+        if convert_request.order_status == "SUCCESS":
+            convert_request.state = "completed"
+            convert_request.reconciliation_required = False
+        elif convert_request.order_status in {"PROCESS", "PENDING", "ACCEPT_SUCCESS"}:
+            convert_request.state = "processing"
+            convert_request.reconciliation_required = True
+        elif convert_request.order_status in {"FAIL", "FAILED", "CANCELED", "EXPIRED"}:
+            convert_request.state = "failed"
+            convert_request.reconciliation_required = False
+        else:
+            convert_request.state = "reconciliation_required"
+            convert_request.reconciliation_required = True
         convert_request.version += 1
         convert_request.order_id = str(order_id) if order_id is not None else None
-        convert_request.order_status = str(status_payload.get("orderStatus", "UNKNOWN"))
-        convert_request.completed_at = datetime.now(UTC)
+        convert_request.completed_at = (
+            datetime.now(UTC) if convert_request.state == "completed" else None
+        )
         await record_audit_event(
             session,
             "convert_completed",
@@ -766,7 +867,12 @@ async def market_indicators(
     async with session_factory() as session:
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == normalized_symbol, Candle.interval == interval)
+            .where(
+                Candle.symbol == normalized_symbol,
+                Candle.interval == interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(limit)
         )
@@ -790,27 +896,51 @@ async def market_indicators(
 async def market_price(
     symbol: str,
     interval: str = Query(default="1m", min_length=1, max_length=16),
+    live: bool = Query(default=False),
 ) -> dict[str, object]:
-    """Return the latest price received by the WebSocket candle ingestor."""
+    """Return a sandbox candle price or a production public ticker explicitly."""
     normalized_symbol = symbol.upper()
     settings = get_settings()
+    if live:
+        try:
+            async with BinanceRestClient(
+                str(settings.live_convert_rest_base_url), settings.binance_timeout_seconds
+            ) as client:
+                price = await client.get_ticker_price(normalized_symbol)
+        except (BinanceRestError, ValueError) as exc:
+            raise HTTPException(status_code=502, detail="live market price unavailable") from exc
+        return {
+            "symbol": normalized_symbol,
+            "interval": interval,
+            "price": price,
+            "updated_at": datetime.now(UTC).isoformat(),
+            "source": "Binance production public ticker",
+        }
     session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == normalized_symbol, Candle.interval == interval)
+            .where(
+                Candle.symbol == normalized_symbol,
+                Candle.interval == interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(1)
         )
         candle = result.scalar_one_or_none()
     if candle is None:
         raise HTTPException(status_code=404, detail="No market price is available yet")
+    age_seconds = (datetime.now(UTC) - candle.received_at).total_seconds()
+    if age_seconds > settings.market_data_max_age_seconds:
+        raise HTTPException(status_code=503, detail="sandbox market data is stale")
     return {
         "symbol": normalized_symbol,
         "interval": interval,
         "price": str(candle.close_price),
-        "updated_at": candle.close_time.isoformat(),
-        "source": "Binance WebSocket kline stream",
+        "updated_at": candle.received_at.isoformat(),
+        "source": "Binance sandbox WebSocket kline stream",
     }
 
 
@@ -837,7 +967,12 @@ async def market_signal(
     async with session_factory() as session:
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == normalized_symbol, Candle.interval == interval)
+            .where(
+                Candle.symbol == normalized_symbol,
+                Candle.interval == interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(limit)
         )
@@ -875,9 +1010,60 @@ async def create_trade_proposal(
     settings = get_settings()
     session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
+        account_balance = request.account_balance
+        risk_source = "request_simulation"
+        api_key = settings.binance_api_key
+        api_secret = settings.binance_api_secret
+        if api_key is not None and api_secret is not None:
+            try:
+                async with BinanceAccountClient(
+                    str(settings.binance_rest_base_url),
+                    api_key.get_secret_value(),
+                    api_secret.get_secret_value(),
+                    timeout_seconds=settings.binance_timeout_seconds,
+                ) as account_client:
+                    account = await account_client.get_account()
+            except (BinanceAccountError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=502, detail="server-side balance verification failed"
+                ) from exc
+            balances = {
+                str(item.get("asset")): float(item.get("free", 0))
+                for item in account.get("balances", [])
+                if isinstance(item, dict)
+            }
+            account_balance = balances.get(settings.market_data_quote_asset, 0.0)
+            risk_source = "binance_account"
+        elif settings.app_mode not in {"paper", "backtest"}:
+            raise HTTPException(
+                status_code=503,
+                detail="server-side Binance credentials are required for risk checks",
+            )
+
+        exposure_result = await session.execute(
+            select(TradeExecution, TradeProposal)
+            .join(TradeProposal, TradeProposal.id == TradeExecution.proposal_id)
+            .where(
+                TradeExecution.status.in_(
+                    ["pending", "new", "partially_filled", "reconciliation_required"]
+                )
+            )
+        )
+        current_exposure = 0.0
+        for _, open_proposal in exposure_result.all():
+            try:
+                current_exposure += float(json.loads(open_proposal.risk_json).get("notional", 0))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        available_balance = max(account_balance - current_exposure, 0.0)
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == normalized_symbol, Candle.interval == request.interval)
+            .where(
+                Candle.symbol == normalized_symbol,
+                Candle.interval == request.interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(request.candle_limit)
         )
@@ -891,9 +1077,9 @@ async def create_trade_proposal(
         candidate = TrendMomentumStrategy().evaluate(normalized_symbol, request.interval, candles)
         risk = RiskEngine().assess(
             candidate,
-            request.account_balance,
-            request.current_exposure,
-            request.available_balance,
+            account_balance,
+            current_exposure,
+            available_balance,
         )
         symbol_result = await session.execute(
             select(Symbol).where(Symbol.symbol == normalized_symbol)
@@ -903,12 +1089,25 @@ async def create_trade_proposal(
             risk = normalize_risk_quantity(
                 risk,
                 candidate.entry_price,
-                request.account_balance,
+                account_balance,
                 symbol.filters_json,
                 settings.max_order_notional,
             )
         proposal = await create_proposal(
             session, candidate, risk, settings.proposal_expiry_seconds, operator.operator_id
+        )
+        await record_audit_event(
+            session,
+            "proposal_risk_snapshot",
+            "risk_service",
+            {
+                "proposal_id": proposal.id,
+                "account_balance": account_balance,
+                "current_exposure": current_exposure,
+                "available_balance": available_balance,
+                "source": risk_source,
+            },
+            str(proposal.id),
         )
         await session.commit()
     return {
@@ -923,7 +1122,9 @@ async def create_trade_proposal(
 
 
 @app.get("/api/v1/proposals", tags=["approvals"])
-async def pending_proposals() -> list[dict[str, object]]:
+async def pending_proposals(
+    _: Annotated[AuthenticatedOperator, Depends(require_approval_token)],
+) -> list[dict[str, object]]:
     settings = get_settings()
     session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
@@ -955,6 +1156,7 @@ async def pending_proposals() -> list[dict[str, object]]:
 
 @app.get("/api/v1/executions", tags=["execution"])
 async def execution_history(
+    _: Annotated[AuthenticatedOperator, Depends(require_approval_token)],
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, object]]:
     settings = get_settings()
@@ -968,7 +1170,10 @@ async def execution_history(
 
 
 @app.get("/api/v1/audit", tags=["audit"])
-async def audit_events(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str, object]]:
+async def audit_events(
+    _: Annotated[AuthenticatedOperator, Depends(require_approval_token)],
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict[str, object]]:
     settings = get_settings()
     session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
@@ -1000,7 +1205,12 @@ async def export_market_candles(
     async with session_factory() as session:
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == symbol.upper(), Candle.interval == interval)
+            .where(
+                Candle.symbol == symbol.upper(),
+                Candle.interval == interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(limit)
         )
@@ -1032,7 +1242,12 @@ async def run_backtest(request: BacktestRequest) -> dict[str, object]:
     async with session_factory() as session:
         result = await session.execute(
             select(Candle)
-            .where(Candle.symbol == normalized_symbol, Candle.interval == request.interval)
+            .where(
+                Candle.symbol == normalized_symbol,
+                Candle.interval == request.interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
             .order_by(desc(Candle.open_time))
             .limit(request.candle_limit)
         )
@@ -1097,7 +1312,7 @@ function setMode(mode){selectedMode=mode;const live=mode==='live';$('liveConvert
 async function api(path,options={}){const headers=options.headers||{};if(token())headers['X-Approval-Token']=token();if(selectedMode==='live')headers['X-Account-Mode']='live';if(options.body)headers['Content-Type']='application/json';const response=await fetch(path,{...options,headers});let data;try{data=await response.json()}catch{data=await response.text()}if(!response.ok)throw new Error(typeof data==='string'?data:(data.detail||'Request failed'));return data}
 async function loadMode(){try{const health=await api('/health/ready');$('mode').textContent=(health.mode||'unknown')+' · trading '+health.trading_enabled;$('mode').className='badge '+(String(health.trading_enabled)==='true'?'candidate':'')}catch(error){$('mode').textContent='Unavailable';setStatus(error.message,true)}}
 async function loadAccount(){try{const endpoint=selectedMode==='live'?'/api/v1/account/live-balances':'/api/v1/account/balances';account=await api(endpoint);const rows=(account.balances||[]).map(b=>'<div class="kv"><span>'+b.asset+'</span><b>'+b.free+' free · '+b.locked+' locked</b></div>').join('');$('balances').innerHTML='<div class="small">'+account.account_type+' · can trade: '+account.can_trade+'</div>'+rows;setStatus((selectedMode==='live'?'Live':'Demo')+' account balances loaded')}catch(error){setStatus(error.message,true)}}
-async function loadLiveMarketPrice(){try{const result=await fetch('/api/v1/market/price/XRPUSDT?interval=1m').then(response=>{if(!response.ok)throw new Error('Market price unavailable');return response.json()});$('liveMarketPrice').innerHTML='<strong>Live market price:</strong> 1 XRP = '+result.price+' USDT <span class="small muted">· updated '+new Date(result.updated_at).toLocaleTimeString()+'</span>'}catch(error){$('liveMarketPrice').innerHTML='<span class="muted">Live market price is connecting…</span>'}}
+async function loadLiveMarketPrice(){try{const result=await fetch('/api/v1/market/price/XRPUSDT?interval=1m&live=true').then(response=>{if(!response.ok)throw new Error('Market price unavailable');return response.json()});$('liveMarketPrice').innerHTML='<strong>Live production market price:</strong> 1 XRP = '+result.price+' USDT <span class="small muted">· updated '+new Date(result.updated_at).toLocaleTimeString()+'</span>'}catch(error){$('liveMarketPrice').innerHTML='<span class="muted">Live market price is connecting…</span>'}}
 async function requestConvertQuote(){if(!token()){setStatus('Enter the approval token first',true);return}try{const result=await api('/api/v1/convert/quotes',{method:'POST',body:JSON.stringify({from_asset:$('convertFrom').value,to_asset:$('convertTo').value,from_amount:Number($('convertAmount').value)})});setStatus('Convert quote '+result.request_id+' created. Review it below.');await loadConvertRequests()}catch(error){setStatus(error.message,true)}}
 let previewRate=null;
 function setPreviewControls(enabled){['limitPrice','offset1','offset5','offset10','createLimitButton'].forEach(id=>$(id).disabled=!enabled)}
@@ -1156,6 +1371,8 @@ async def execute_trade_proposal(
     settings = get_settings()
     session_factory = create_session_factory(settings.database_url)
     async with session_factory() as session:
+        if await execution_is_stopped(session):
+            raise HTTPException(status_code=503, detail="emergency stop is enabled")
         proposal_result = await session.execute(
             select(TradeProposal).where(TradeProposal.id == proposal_id).with_for_update()
         )
@@ -1166,6 +1383,18 @@ async def execute_trade_proposal(
             raise HTTPException(
                 status_code=409, detail="proposal is not approved or version is stale"
             )
+        if proposal.expires_at <= datetime.now(UTC):
+            proposal.state = "expired"
+            proposal.version += 1
+            await record_audit_event(
+                session,
+                "proposal_expired_at_execution",
+                "execution_service",
+                {"proposal_id": proposal.id, "operator_id": operator.operator_id},
+                str(proposal.id),
+            )
+            await session.commit()
+            raise HTTPException(status_code=409, detail="proposal has expired")
 
         execution_result = await session.execute(
             select(TradeExecution).where(TradeExecution.proposal_id == proposal_id)
@@ -1180,6 +1409,25 @@ async def execute_trade_proposal(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if intent.quantity * intent.reference_price > Decimal(str(settings.max_order_notional)):
             raise HTTPException(status_code=422, detail="order exceeds configured notional cap")
+        latest_candle_result = await session.execute(
+            select(Candle)
+            .where(
+                Candle.symbol == proposal.symbol,
+                Candle.interval == proposal.interval,
+                Candle.environment == "sandbox",
+                Candle.is_closed.is_(True),
+            )
+            .order_by(desc(Candle.open_time))
+            .limit(1)
+        )
+        latest_candle = latest_candle_result.scalar_one_or_none()
+        if latest_candle is None:
+            raise HTTPException(status_code=409, detail="no current market price is available")
+        current_price = Decimal(str(latest_candle.close_price))
+        if intent.quantity * current_price > Decimal(str(settings.max_order_notional)):
+            raise HTTPException(
+                status_code=422, detail="current order notional exceeds configured cap"
+            )
         symbol_result = await session.execute(
             select(Symbol).where(Symbol.symbol == proposal.symbol)
         )
@@ -1231,6 +1479,22 @@ async def execute_trade_proposal(
                     result = await executor.execute(intent)
             else:
                 result = await DryRunOrderExecutor().execute(intent)
+        except OrderExecutionUncertain as exc:
+            record.status = "reconciliation_required"
+            record.message = str(exc)
+            record.completed_at = None
+            await record_audit_event(
+                session,
+                "execution_reconciliation_required",
+                "execution_service",
+                {"proposal_id": proposal.id, "operator_id": operator.operator_id},
+                str(proposal.id),
+            )
+            await session.commit()
+            raise HTTPException(
+                status_code=202,
+                detail="order outcome is unknown; reconcile before retrying",
+            ) from exc
         except OrderExecutionError as exc:
             record.status = "failed"
             record.message = str(exc)

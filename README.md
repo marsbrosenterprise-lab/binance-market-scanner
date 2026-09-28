@@ -20,7 +20,7 @@ Trade proposals are persisted with signal and risk snapshots. Proposal creation 
 The configured `OPERATOR_ID` is recorded in proposal audit events; approval tokens are never logged.
 The execution boundary supports a deterministic dry-run adapter and a separately gated Binance Spot Testnet adapter. The current default remains dry-run and never submits an exchange request.
 
-Live Convert uses separate credentials and is restricted to `api.binance.com`. Instant conversions follow quote → review → approval → accept, with a minimum from amount of 0.01 USDT. XRP trigger plans are monitored locally against stored XRPUSDT candles; they are not Binance-native limit orders. A plan is manual by default. An operator can explicitly arm one plan for one-shot automatic execution; the monitor then requests a fresh quote, verifies that its effective rate satisfies the trigger, accepts it, and verifies the resulting order status. Plans can be cancelled, disarmed, expire, and all lifecycle events are audited.
+Live Convert uses separate credentials and is restricted to `api.binance.com`. Instant conversions follow quote → review → approval → accept, with a minimum from amount of 0.01 USDT. XRP trigger plans are application-managed and are not Binance-native limit orders. In live mode, the one-second monitor reads Binance's production public ticker; sandbox candles remain separate for demo/testnet analysis. A plan is manual by default. An operator can explicitly arm one plan for one-shot automatic execution; the monitor atomically claims it, requests a fresh quote, verifies that its effective rate satisfies the trigger, accepts it once, and reconciles the resulting order status. Pending, failed, and unknown outcomes are retained for recovery; an unknown outcome is never resubmitted automatically. Plans can be cancelled, disarmed, expire, and all lifecycle events are audited.
 
 Offline backtests can be run with `python -m binance_scanner backtest --csv candles.csv --symbol BTCUSDT`. The CSV format is strictly `timestamp,open,high,low,close` with timezone-aware, strictly increasing timestamps.
 
@@ -32,6 +32,9 @@ Offline backtests can be run with `python -m binance_scanner backtest --csv cand
 - Withdrawal capability is disabled by configuration and is not implemented.
 - Live Convert is disabled unless explicitly enabled with separate credentials and an allowlist.
 - Limit Convert plans are never automatically armed. Automatic execution requires the dashboard approval token and an explicit per-plan **Arm auto-execution** action; the local configuration flag is disabled by default.
+- Proposal risk checks use server-side Binance balances and the execution ledger when credentials are configured; browser-supplied balances are only accepted in explicit `paper`/`backtest` modes.
+- Signal stop/target values are informational only; the application does not place automatic exit orders.
+- A persistent emergency stop is available through the authenticated safety endpoint and is checked before arming or executing work.
 - Credentials are not committed or required for the Phase 1 health checks.
 
 See [docs/phase-0-requirements.md](docs/phase-0-requirements.md) for the approved scope and safety requirements.
@@ -54,3 +57,9 @@ ruff format --check .
 mypy src
 pytest
 ```
+
+GitHub Actions also provisions an isolated PostgreSQL service, applies all Alembic migrations, and runs the same checks on pushes and pull requests.
+
+## Not implemented yet
+
+Grid/ladder buying, position tracking, realized and unrealized P&L, reserved-balance accounting across multiple plans, and automatic profit-taking remain outside this reliability phase. Spot execution remains sandbox-only, and unresolved Spot submissions are marked for reconciliation using their client order ID before any retry is considered.

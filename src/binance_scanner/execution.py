@@ -12,6 +12,10 @@ class OrderExecutionError(RuntimeError):
     """Raised when an order intent cannot be safely executed."""
 
 
+class OrderExecutionUncertain(OrderExecutionError):
+    """The exchange outcome is unknown and must be reconciled before retrying."""
+
+
 @dataclass(frozen=True, slots=True)
 class OrderIntent:
     client_order_id: str

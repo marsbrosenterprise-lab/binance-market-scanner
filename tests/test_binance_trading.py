@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from binance_scanner.binance.trading import BinanceTradingClient, sign_params
-from binance_scanner.execution import OrderIntent
+from binance_scanner.execution import OrderExecutionUncertain, OrderIntent
 
 
 def test_sign_params_is_deterministic() -> None:
@@ -67,3 +67,26 @@ async def test_signed_client_supports_demo_endpoint() -> None:
 
     assert result.exchange_order_id == "456"
     assert result.message == "order submitted to Binance Spot Demo"
+
+
+@pytest.mark.asyncio
+async def test_signed_client_marks_timeout_as_uncertain_without_retrying() -> None:
+    calls = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("exchange did not answer")
+
+    intent = OrderIntent("proposal-9", "BTCUSDT", "BUY", Decimal("0.25"), Decimal("100"))
+    async with BinanceTradingClient(
+        "https://testnet.binance.vision",
+        "key",
+        "secret",
+        enabled=True,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(OrderExecutionUncertain, match="outcome is unknown"):
+            await client.execute(intent)
+
+    assert calls == 1

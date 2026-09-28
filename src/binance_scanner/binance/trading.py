@@ -13,6 +13,7 @@ import httpx
 from binance_scanner.execution import (
     ExecutionResult,
     OrderExecutionError,
+    OrderExecutionUncertain,
     OrderExecutor,
     OrderIntent,
 )
@@ -77,6 +78,16 @@ class BinanceTradingClient(OrderExecutor):
             )
             response.raise_for_status()
             payload = response.json()
+        except httpx.TimeoutException as exc:
+            raise OrderExecutionUncertain(
+                "signed Binance order request timed out; exchange outcome is unknown"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500:
+                raise OrderExecutionUncertain(
+                    "Binance returned a server error; exchange outcome is unknown"
+                ) from exc
+            raise OrderExecutionError("signed Binance order request was rejected") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise OrderExecutionError("signed Binance order request failed") from exc
         if not isinstance(payload, Mapping) or "orderId" not in payload:
@@ -93,6 +104,31 @@ class BinanceTradingClient(OrderExecutor):
                 + ("Demo" if self._host == "demo-api.binance.com" else "Testnet")
             ),
         )
+
+    async def get_order_status(self, client_order_id: str) -> Mapping[str, Any]:
+        params: dict[str, str | int] = {
+            "origClientOrderId": client_order_id,
+            "recvWindow": self._recv_window,
+            "timestamp": self._clock_ms(),
+        }
+        params["signature"] = sign_params(params, self._api_secret)
+        try:
+            response = await self._client.get(
+                "/api/v3/order", params=params, headers={"X-MBX-APIKEY": self._api_key}
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.TimeoutException as exc:
+            raise OrderExecutionUncertain("order status lookup timed out") from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500:
+                raise OrderExecutionUncertain("order status lookup has unknown outcome") from exc
+            raise OrderExecutionError("order status lookup was rejected") from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise OrderExecutionUncertain("order status lookup failed") from exc
+        if not isinstance(payload, Mapping):
+            raise OrderExecutionUncertain("Binance returned an invalid order status")
+        return payload
 
 
 def sign_params(params: Mapping[str, str | int], secret: bytes) -> str:

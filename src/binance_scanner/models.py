@@ -142,3 +142,26 @@ class ConvertRequest(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DraftProposal(Base):
+    __tablename__ = "draft_proposals"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
+    amount_asset: Mapped[str] = mapped_column(String(16), nullable=False)
+    entry_condition: Mapped[str] = mapped_column(String(500), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    exit_conditions_json: Mapped[str] = mapped_column(Text, nullable=False)
+    reasoning: Mapped[str] = mapped_column(String(2000), nullable=False)
+    uncertainty: Mapped[str] = mapped_column(String(1000), nullable=False)
+    snapshot_refs_json: Mapped[str] = mapped_column(Text, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    origin: Mapped[str] = mapped_column(String(32), nullable=False, default="mcp")
+    schema_version: Mapped[str] = mapped_column(String(16), nullable=False, default="1")
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="unapproved", index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )

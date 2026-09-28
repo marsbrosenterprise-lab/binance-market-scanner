@@ -51,6 +51,15 @@ class Settings(BaseSettings):
     live_convert_max_from_amount: float = Field(default=10.0, gt=0, le=1000)
     approval_token: SecretStr | None = None
     operator_id: str = Field(default="local-operator", min_length=1, max_length=128)
+    mcp_auth_token: SecretStr | None = None
+    mcp_auth_mode: Literal["static", "introspection"] = "static"
+    mcp_auth_issuer_url: str = "https://auth.example.invalid"
+    mcp_resource_url: str = "http://localhost:8000/mcp"
+    mcp_required_scope: str = "binance:read"
+    mcp_introspection_url: str | None = None
+    mcp_introspection_client_id: str | None = None
+    mcp_introspection_client_secret: SecretStr | None = None
+    mcp_max_requests_per_minute: int = Field(default=60, ge=1, le=600)
 
     trading_enabled: bool = False
     withdrawals_enabled: bool = False

@@ -19,6 +19,9 @@ from mcp.types import ToolAnnotations
 from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
 from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
 from binance_scanner.binance.account import (
     BinanceAccountClient,
@@ -183,7 +186,34 @@ mcp = MCPServer(
     ),
     auth=_auth_settings(_settings),
 )
-mcp_http_app = mcp.streamable_http_app()
+
+
+def _protected_resource_metadata(_: object) -> JSONResponse:
+    return JSONResponse(
+        {
+            "resource": _settings.mcp_resource_url,
+            "authorization_servers": [_settings.mcp_auth_issuer_url],
+            "scopes_supported": [_settings.mcp_required_scope, _settings.mcp_draft_scope],
+            "bearer_methods_supported": ["header"],
+        }
+    )
+
+
+def _protected_resource_metadata_path(resource_url: str) -> str:
+    resource_path = urlsplit(resource_url).path.rstrip("/")
+    return f"/.well-known/oauth-protected-resource{resource_path}"
+
+
+mcp_http_app = Starlette(
+    routes=[
+        Route(
+            _protected_resource_metadata_path(_settings.mcp_resource_url),
+            _protected_resource_metadata,
+            methods=["GET"],
+        ),
+        Mount("/", app=mcp.streamable_http_app()),
+    ]
+)
 
 READ_ANNOTATIONS = ToolAnnotations(
     read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True
